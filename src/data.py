@@ -1,15 +1,20 @@
 import json
-from functools import reduce
 
-import pandas as pd
+import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 
-def get_scene_ids(root, num=None):
-    raw_data = pd.read_csv(root / "index.csv")
-    cleaned_column = raw_data["video_id"].drop_duplicates(keep='first').tolist()
-    return cleaned_column[:num]
-
+# def get_scene_ids(root, num=None):
+#     raw_data = pd.read_csv(root / "index.csv")
+#     cleaned_column = raw_data["video_id"].drop_duplicates(keep='first').tolist()
+#     return cleaned_column[:num]
+def get_scene_ids(root, number=None):
+    scene_ids = sorted(
+        path.stem
+        for path in (root / "states").glob("*.jsonl")
+    )
+    return scene_ids[:number]
 
 def read_json_records(path):
     with open(path, "r", encoding="utf-8") as file:
@@ -35,7 +40,7 @@ def read_json_records(path):
         return result
 
 
-def load_scene(root, scene_id, stride=1):
+def load_scene(root, scene_id):
     states = read_json_records(root / "states" / f"{scene_id}.jsonl")
     captions = read_json_records(root / "captions" / f"{scene_id}.jsonl")
 
@@ -44,10 +49,6 @@ def load_scene(root, scene_id, stride=1):
     scene = []
     for position, (state, caption) in enumerate(zip(states, captions)):
         assert state["frame_id"] == position, "frame id not aligned"
-
-        # handle stride
-        if position % stride != 0:
-            continue
 
         image_path = root / state["image_path"]
         if not image_path.is_file():
@@ -58,26 +59,63 @@ def load_scene(root, scene_id, stride=1):
                 "scene_id": scene_id,
                 "frame_id": position,
                 "state": state,
-                "position" : position,
+                "caption" : caption,
                 "image_path": image_path,
             }
         )
     return scene
+
+def sample_trajectory(raw_trajectory, number=10):
+    trajectory = torch.as_tensor(
+        data=raw_trajectory,
+        dtype=torch.float32
+    )
+
+    if trajectory.shape != (60, 3):
+        raise ValueError(
+            f"Expected trajectory shape (60, 3), got {trajectory.shape}"
+        )
+
+    if not torch.isfinite(trajectory).all():
+        raise ValueError("Trajectory contains NaN or infinity")
+
+    indices = torch.linspace(
+        0,
+        len(trajectory) - 1,
+        steps=number,
+    ).round().long()
+
+    return trajectory[indices]
 
 
 class CoVLADataset(Dataset):
     def __init__(self, root, frame_interval):
         self.root = root
         self.frame_interval = frame_interval
-        self.scenes = reduce(
-            lambda acc, x : acc.append(load_scene(self.root, scene_id=x, stride=frame_interval)), 
-            get_scene_ids(self.root, 1), 
-            []
-        )
+        self.scenes = [
+            load_scene(self.root, scene_id=x)
+            for x in get_scene_ids(self.root, 1)
+        ]
+
 
     def __len__(self):
         return len(self.scenes)
     
     def __getitem__(self, index):
-        return self.scenes[index]
+        scene = self.scenes[index]
+        state = scene["state"]
 
+        with Image.open(scene["image_path"]) as raw_image:
+            image = raw_image.convert("RGB")
+
+        return {
+            "image": image,
+            "speed": torch.tensor(
+                state["ego_state"]["vEgo"],
+                dtype=torch.float32,
+            ),
+            "caption": scene["caption"]["rich_caption"],
+            "trajectory": sample_trajectory(state["trajectory"]),
+            "scene_id": scene["scene_id"],
+            "frame_id": scene["frame_id"],
+        }
