@@ -5,16 +5,13 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-# def get_scene_ids(root, num=None):
-#     raw_data = pd.read_csv(root / "index.csv")
-#     cleaned_column = raw_data["video_id"].drop_duplicates(keep='first').tolist()
-#     return cleaned_column[:num]
 def get_scene_ids(root, number=None):
     scene_ids = sorted(
         path.stem
         for path in (root / "states").glob("*.jsonl")
     )
     return scene_ids[:number]
+
 
 def read_json_records(path):
     with open(path, "r", encoding="utf-8") as file:
@@ -92,14 +89,20 @@ class CoVLADataset(Dataset):
     def __init__(self, root, frame_interval):
         self.root = root
         self.frame_interval = frame_interval
-        self.scenes = [
-            load_scene(self.root, scene_id=x)
-            for x in get_scene_ids(self.root, 1)
-        ]
+        self.scenes = []
+        for scene_id in get_scene_ids(self.root, 1):
+            scene = load_scene(self.root, scene_id=scene_id)
+            self.scenes.extend(
+                sample 
+                for sample in scene
+                if sample["frame_id"] % self.frame_interval == 0
+            )
+
 
 
     def __len__(self):
         return len(self.scenes)
+
     
     def __getitem__(self, index):
         scene = self.scenes[index]
