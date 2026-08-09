@@ -89,23 +89,22 @@ class CoVLADataset(Dataset):
     def __init__(self, root, frame_interval):
         self.root = root
         self.frame_interval = frame_interval
-        self.scenes = []
+
+        # sample is a bundle of state, caption and image path.
+        self.sample = [] # list of sample loaded
         for scene_id in get_scene_ids(self.root, 1):
             scene = load_scene(self.root, scene_id=scene_id)
-            self.scenes.extend(
+            self.sample.extend(
                 sample 
                 for sample in scene
                 if sample["frame_id"] % self.frame_interval == 0
             )
 
-
-
     def __len__(self):
-        return len(self.scenes)
+        return len(self.sample)
 
-    
     def __getitem__(self, index):
-        scene = self.scenes[index]
+        scene = self.sample[index]
         state = scene["state"]
 
         with Image.open(scene["image_path"]) as raw_image:
