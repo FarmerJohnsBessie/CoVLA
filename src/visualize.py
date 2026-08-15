@@ -26,6 +26,7 @@ def project_trajectory(state):
     camera_points = (extrinsic @ trajectory_extended.T).T[:, :3] # N x 3
 
     projected = (intrinsic @ camera_points.T).T # N x 3
+    # (x, y, depth)
 
     pixels = projected[:, :2] / projected[:, 2:3]
 
@@ -82,3 +83,10 @@ def plot_sample(sample):
     )
 
     return figure
+
+
+def plot_BEV(sample):
+    state = sample["state"]
+    trajectory = state["trajectory"]
+    plt.plot(torch.flatten(trajectory[:, 0]), torch.flatten(trajectory[:, 1]))
+    plt.show()

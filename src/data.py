@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -86,18 +87,23 @@ def sample_trajectory(raw_trajectory, number=10):
 
 
 class CoVLADataset(Dataset):
-    def __init__(self, root, frame_interval):
-        self.root = root
+    def __init__(self, root, frame_interval=10, scene_ids=None, number=None):
+        self.root = Path(root)
         self.frame_interval = frame_interval
 
+        if frame_interval <= 0:
+            raise ValueError("frame_interval must be positive")
+
         # sample is a bundle of state, caption and image path.
-        self.sample = [] # list of sample loaded
-        for scene_id in get_scene_ids(self.root, 1):
+        self.sample = [] # list of samples loaded
+        selected_scene_ids = scene_ids or get_scene_ids(self.root, number)
+        for scene_id in selected_scene_ids:
             scene = load_scene(self.root, scene_id=scene_id)
             self.sample.extend(
                 sample 
                 for sample in scene
                 if sample["frame_id"] % self.frame_interval == 0
+                and sample["state"]["trajectory_count"] == 60
             )
 
     def __len__(self):
