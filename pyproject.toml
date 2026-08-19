@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=3.0.5",
     "peft>=0.20.0",
     "pillow>=12.3.0",
+    "tensorboard>=2.21.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
     "transformers>=5.14.1",
