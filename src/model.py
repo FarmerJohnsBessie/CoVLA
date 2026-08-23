@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, CLIPVisionModel, PreTrainedModel
+import torch.nn.functional as F
 
 
 @dataclass
@@ -186,11 +187,11 @@ class Week2VLAModel(nn.Module):
             [prefix_mask, caption_mask, query_mask], dim=1
         )
         
-        # --- Calculate Position ---
+        # --- Calculate Position (Tells the token order) ---
         position_ids = input_mask.long().cumsum(dim=1) - 1
         position_ids.masked_fill_(input_mask == 0, 0)
 
-        # --- Calculate Labels ---
+        # --- Calculate Labels (Which tokens predicting next token) ---
         labels = torch.full(
             input_tokens.shape[:2],
             -100
@@ -213,12 +214,26 @@ class Week2VLAModel(nn.Module):
             return_dict=True
         )
         caption_loss = language_output.loss
-        hidden = language_output.hidden_states[-1]
+        hidden = language_output.hidden_states[-1] # (B, L, 4096)
 
-        return {}
+        # --- Get Trajectory ---
+        queries = hidden[:, -self.config.trajectory_points :]
+        pred_trajectories = self.trajectory_head(queries)
+
+        # Calculate loss
+        trajectory_loss = F.mse_loss(pred_trajectories, gt_trajectory)
+
+
+        return {
+            "loss" : 0.5 * caption_loss + 0.5 * trajectory_loss,
+            "trajectory_losss" : trajectory_loss,
+            "caption_loss": caption_loss,
+            "pred_trajectory": pred_trajectories
+        }
 
 
 
 def build_model(config: Week2CoVLAConfig) -> Week2VLAModel:
     """Construct and return your Week2VLAModel."""
-    raise NotImplementedError("Implement build_model")
+    return Week2VLAModel(config)
+    
