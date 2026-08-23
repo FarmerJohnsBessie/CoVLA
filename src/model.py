@@ -32,9 +32,11 @@ class Week2CoVLAConfig:
     batch_size: int = 2
     learning_rate: float = 2e-5
     num_epochs: int = 5
+    max_caption_tokens: int = 128
     device: str = field(
         default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
     )
+    max_grad_norm: float = 1.0
 
     train_ratio: float = 0.8
 
@@ -236,4 +238,4 @@ class Week2VLAModel(nn.Module):
 def build_model(config: Week2CoVLAConfig) -> Week2VLAModel:
     """Construct and return your Week2VLAModel."""
     return Week2VLAModel(config)
-    
+

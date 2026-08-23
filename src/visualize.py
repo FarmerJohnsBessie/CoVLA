@@ -1,6 +1,7 @@
 import textwrap
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from PIL import Image
 
@@ -34,11 +35,60 @@ def project_trajectory(state):
 
 
 
+# def plot_sample(sample):
+#     """Display image, projected trajectory, caption, and metadata."""
+#     # REQUIRES: The sample should be obtained from the load_scene function, 
+#     #           Not the dataset
+#     state = sample["state"] 
+#     pixels = project_trajectory(state)
+
+#     with Image.open(sample["image_path"]) as raw_image:
+#         image = raw_image.convert("RGB")
+
+#     width, height = image.size
+
+#     figure, axis = plt.subplots(figsize=(12, 8))
+
+#     axis.imshow(image)
+
+#     if len(pixels):
+#         axis.plot(
+#             pixels[:, 0],
+#             pixels[:, 1],
+#             color="#7CFC00",
+#             linewidth=4,
+#         )
+
+#     # Prevent extreme near-camera points from resizing the axes.
+#     axis.set_xlim(0, width)
+#     axis.set_ylim(height, 0)
+#     axis.axis("off")
+
+#     caption = sample["caption"]["rich_caption"]
+#     wrapped_caption = "\n".join(textwrap.wrap(caption, width=100))
+
+#     figure.text(
+#         0.5,
+#         0.02,
+#         wrapped_caption,
+#         ha="center",
+#         va="bottom",
+#         fontsize=10,
+#     )
+
+#     figure.subplots_adjust(
+#         left=0,
+#         right=1,
+#         top=0.95,
+#         bottom=0.18,
+#     )
+
+#     return figure
+
 def plot_sample(sample):
-    """Display image, projected trajectory, caption, and metadata."""
-    # REQUIRES: The sample should be obtained from the load_scene function, 
-    #           Not the dataset
-    state = sample["state"] 
+    """Display image + projected trajectory and GT trajectory in BEV."""
+
+    state = sample["state"]
     pixels = project_trajectory(state)
 
     with Image.open(sample["image_path"]) as raw_image:
@@ -46,25 +96,72 @@ def plot_sample(sample):
 
     width, height = image.size
 
-    figure, axis = plt.subplots(figsize=(12, 8))
+    # Two plots side-by-side
+    figure, (image_axis, bev_axis) = plt.subplots(
+        1, 2,
+        figsize=(16, 7),
+    )
 
-    axis.imshow(image)
+    # ============================================================
+    # LEFT: Camera image + projected GT trajectory
+    # ============================================================
+
+    image_axis.imshow(image)
 
     if len(pixels):
-        axis.plot(
+        image_axis.plot(
             pixels[:, 0],
             pixels[:, 1],
             color="#7CFC00",
             linewidth=4,
         )
 
-    # Prevent extreme near-camera points from resizing the axes.
-    axis.set_xlim(0, width)
-    axis.set_ylim(height, 0)
-    axis.axis("off")
+    image_axis.set_xlim(0, width)
+    image_axis.set_ylim(height, 0)
+    image_axis.axis("off")
+    image_axis.set_title("Camera View")
+
+    # ============================================================
+    # RIGHT: GT Bird's Eye View
+    # ============================================================
+
+    gt_trajectory = state["trajectory"] 
+    gt_trajectory = np.asarray(
+        state["trajectory"],
+        dtype=float,
+    )
+
+    bev_axis.plot(
+        gt_trajectory[:, 0],
+        gt_trajectory[:, 1],
+        marker="o",
+        label="GT",
+    )
+
+    # Ego vehicle starts at the origin
+    bev_axis.scatter(
+        0,
+        0,
+        marker="*",
+        s=200,
+        label="Ego",
+    )
+
+    bev_axis.set_title("Bird's Eye View")
+    bev_axis.set_xlabel("Forward (m)")
+    bev_axis.set_ylabel("Lateral (m)")
+    bev_axis.grid(True)
+    bev_axis.legend()
+    bev_axis.axis("equal")
+
+    # ============================================================
+    # Caption
+    # ============================================================
 
     caption = sample["caption"]["rich_caption"]
-    wrapped_caption = "\n".join(textwrap.wrap(caption, width=100))
+    wrapped_caption = "\n".join(
+        textwrap.wrap(caption, width=120)
+    )
 
     figure.text(
         0.5,
@@ -76,17 +173,11 @@ def plot_sample(sample):
     )
 
     figure.subplots_adjust(
-        left=0,
-        right=1,
-        top=0.95,
+        left=0.03,
+        right=0.97,
+        top=0.92,
         bottom=0.18,
+        wspace=0.15,
     )
 
     return figure
-
-
-def plot_BEV(sample):
-    state = sample["state"]
-    trajectory = state["trajectory"]
-    plt.plot(torch.flatten(trajectory[:, 0]), torch.flatten(trajectory[:, 1]))
-    plt.show()
