@@ -106,11 +106,11 @@ class Week2DataCollator:
         )["pixel_values"]
 
         return {
-            "pixel_values": pixel_values,
+            "pixel_values": pixel_values, # (B, 3, 244, 244)
             "ego_speed": torch.stack(
                 [sample["speed"] for sample in samples]
-            ),
-            "prompt_ids": self.prompt_ids.unsqueeze(0).repeat(batch_size,1),
+            ), # (B, )
+            "prompt_ids": self.prompt_ids.unsqueeze(0).repeat(batch_size,1), # (B, Number of words)
             "prompt_mask": self.prompt_mask.unsqueeze(0).repeat(batch_size,1),
             "caption_ids": caption_input_ids,
             "caption_mask": caption_attention_mask,
@@ -256,7 +256,7 @@ def build_train_val_datasets(config: Week2CoVLAConfig) -> tuple[CoVLADataset, Co
             "Training and validation require at least two scenes"
         )
 
-    random.Random(42).shuffle(scene_ids)
+    # random.Random(42).shuffle(scene_ids)
 
     split = round(len(scene_ids) * config.train_ratio)
     split = min(max(split, 1), len(scene_ids) - 1)

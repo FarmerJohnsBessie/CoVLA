@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModelForCausalLM, CLIPVisionModel, PreTrainedModel
-import torch.nn.functional as F
 
 
 @dataclass
@@ -220,7 +220,7 @@ class Week2VLAModel(nn.Module):
 
         # --- Get Trajectory ---
         queries = hidden[:, -self.config.trajectory_points :]
-        pred_trajectories = self.trajectory_head(queries)
+        pred_trajectories = self.trajectory_head(queries) # (B, 10, 3)
 
         # Calculate loss
         trajectory_loss = F.mse_loss(pred_trajectories, gt_trajectory)
