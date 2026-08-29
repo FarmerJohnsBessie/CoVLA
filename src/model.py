@@ -33,9 +33,7 @@ class Week2CoVLAConfig:
     learning_rate: float = 2e-5
     num_epochs: int = 5
     max_caption_tokens: int = 128
-    device: str = field(
-        default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device: str = "cuda"
     max_grad_norm: float = 1.0
 
     train_ratio: float = 0.8
@@ -143,7 +141,9 @@ class Week2VLAModel(nn.Module):
         # Get the mask
         visual_mask = torch.ones(
             batch_size,
-            vision_tokens.shape[1] + 1
+            vision_tokens.shape[1] + 1,
+            device=prompt_mask.device,
+            dtype=prompt_mask.dtype
         )
         prefix_mask = torch.cat(
             [visual_mask, prompt_mask], dim=1
@@ -178,11 +178,13 @@ class Week2VLAModel(nn.Module):
         query_mask = torch.ones(
                     batch_size,
                     self.config.trajectory_points,
+                    device=caption_mask.device,
+                    dtype=caption_mask.dtype
                 ) # (B, 10)
 
         # --- Finalize Input to LLM ---
         input_tokens = torch.cat(
-            [prefix_tokens, caption_tokens, query_tokens]
+            [prefix_tokens, caption_tokens, query_tokens], dim=1
         ) # Query after token because we need attention from caption for query
 
         input_mask = torch.cat(
@@ -196,7 +198,9 @@ class Week2VLAModel(nn.Module):
         # --- Calculate Labels (Which tokens predicting next token) ---
         labels = torch.full(
             input_tokens.shape[:2],
-            -100
+            -100,
+            device=input_tokens.device,
+            dtype=torch.long
         )
 
         start = prefix_tokens.shape[1]
@@ -207,7 +211,7 @@ class Week2VLAModel(nn.Module):
 
         # --- Get LLM output ---
         language_output = self.language_model(
-            input_embeds=input_tokens,
+            inputs_embeds=input_tokens,
             attention_mask=input_mask,
             position_ids=position_ids,
             labels=labels,
@@ -228,7 +232,7 @@ class Week2VLAModel(nn.Module):
 
         return {
             "loss" : 0.5 * caption_loss + 0.5 * trajectory_loss,
-            "trajectory_losss" : trajectory_loss,
+            "trajectory_loss" : trajectory_loss,
             "caption_loss": caption_loss,
             "pred_trajectory": pred_trajectories
         }

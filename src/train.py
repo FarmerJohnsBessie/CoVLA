@@ -63,7 +63,10 @@ class Week2DataCollator:
         )
 
         self.prompt_ids = prompt["input_ids"][0]
-        self.prompt_mask = prompt["attention_mask"][0]    
+        self.prompt_mask = prompt["attention_mask"][0] 
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token  
 
 
 
@@ -140,7 +143,15 @@ class Week2VLATrainer:
 
         self.global_step = 0
         self.writer = SummaryWriter(config.log_dir)
+        self.device = torch.device(self.config.device) 
 
+
+
+    def _move(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {
+            key: value.to(self.device)
+            for key, value in batch.items()
+        }
 
     def train_epoch(self, loader: DataLoader) -> dict[str, float]:
         self.model.train()
@@ -152,9 +163,12 @@ class Week2VLATrainer:
         sample_count = 0
 
         for batch in loader:
+            batch = self._move(batch)
+
             self.optimizer.zero_grad()
-            output = self.model(**batch)
-            loss = output["loss"]
+            with torch.autocast("cuda",dtype=torch.bfloat16):
+                output = self.model(**batch)
+                loss = output["loss"]
 
             loss.backward()
 
@@ -215,8 +229,12 @@ class Week2VLATrainer:
         targets = []
 
         for batch in loader:
-            output = self.model(**batch)
+            batch = self._move(batch)
 
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output = self.model(**batch)
+
+            
             batch_size = batch["pixel_values"].shape[0]
             sample_count += batch_size
 
@@ -229,7 +247,7 @@ class Week2VLATrainer:
                 output["pred_trajectory"].detach().cpu()
             )
             targets.append(
-                batch["target_trajectory"].detach().cpu()
+                batch["gt_trajectory"].detach().cpu()
             )
 
         pred = torch.cat(predictions)
@@ -279,6 +297,71 @@ def build_train_val_datasets(config: Week2CoVLAConfig) -> tuple[CoVLADataset, Co
     return train_dataset, val_dataset
 
 
-def run_week2_training(config: Week2CoVLAConfig) -> list[dict[str, float]]:
-    """Build datasets, loaders, model, and trainer, then run the epoch loop."""
-    raise NotImplementedError("Implement run_week2_training")
+def run_week2_training(
+    config: Week2CoVLAConfig,
+) -> list[dict[str, float]]:
+    train_dataset, val_dataset = build_train_val_datasets(config)
+    collator = Week2DataCollator(config)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    device = torch.device(config.device)
+    model = build_model(config).to(device)
+    trainer = Week2VLATrainer(model, config)
+
+    history = []
+
+    try:
+        for epoch in range(config.num_epochs):
+            train_metrics = trainer.train_epoch(train_loader)
+            val_metrics = trainer.evaluate(val_loader)
+
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                **{
+                    f"train_{key}": value
+                    for key, value in train_metrics.items()
+                },
+                **{
+                    f"val_{key}": value
+                    for key, value in val_metrics.items()
+                },
+            }
+            history.append(epoch_metrics)
+
+            for key, value in train_metrics.items():
+                trainer.writer.add_scalar(
+                    f"epoch/train_{key}",
+                    value,
+                    epoch + 1,
+                )
+
+            for key, value in val_metrics.items():
+                trainer.writer.add_scalar(
+                    f"epoch/val_{key}",
+                    value,
+                    epoch + 1,
+                )
+
+            print(epoch_metrics)
+
+    finally:
+        trainer.writer.close()
+
+    return history
