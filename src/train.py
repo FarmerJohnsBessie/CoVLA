@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import random
 from pathlib import Path
 from typing import Any
 
 import torch
+import wandb
+from matplotlib import pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -12,6 +13,15 @@ from transformers import AutoTokenizer, CLIPImageProcessor
 
 from src.data import CoVLADataset, get_scene_ids
 from src.model import Week2CoVLAConfig, Week2VLAModel
+
+use_wandb = True
+wandb_api = "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"
+
+if use_wandb:
+  wandb.login(key=wandb_api)
+  wandb.init(project="CoVLA", name="mini-training")
+else:
+  wandb.init(mode='disabled')  
 
 
 def compute_ade(pred: torch.Tensor, gt: torch.Tensor) -> float:
@@ -123,6 +133,42 @@ class Week2DataCollator:
         }
 
 
+@torch.inference_mode()
+def generate_caption(
+    model: Week2VLAModel,
+    sample: dict[str, Any],
+    collator: Week2DataCollator,
+    max_new_tokens: int = 64,
+) -> str:
+    """Generate a caption for one dataset sample from its image and speed."""
+    model.eval()
+    device = next(model.parameters()).device
+    batch = {
+        key: value.to(device)
+        for key, value in collator([sample]).items()
+    }
+
+    prefix_tokens, prefix_mask = model._encode_prefix(
+        batch["pixel_values"],
+        batch["ego_speed"],
+        batch["prompt_ids"],
+        batch["prompt_mask"],
+    )
+    language_dtype = next(model.language_model.parameters()).dtype
+    generated_ids = model.language_model.generate(
+        inputs_embeds=prefix_tokens.to(language_dtype),
+        attention_mask=prefix_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        eos_token_id=collator.tokenizer.eos_token_id,
+        pad_token_id=collator.tokenizer.pad_token_id,
+    )
+    return collator.tokenizer.decode(
+        generated_ids[0],
+        skip_special_tokens=True,
+    ).strip()
+
+
 class Week2VLATrainer:
     """Implement optimization, validation, metrics, and logging here."""
 
@@ -142,6 +188,7 @@ class Week2VLATrainer:
         )
 
         self.global_step = 0
+        self.total_sample = 0
         self.writer = SummaryWriter(config.log_dir)
         self.device = torch.device(self.config.device) 
 
@@ -207,8 +254,17 @@ class Week2VLATrainer:
                 float(grad_norm),
                 self.global_step,
             )
-
             self.global_step += 1
+            self.total_sample += batch_size
+
+            wandb.log({
+                "samples_seen": self.total_sample,
+                "batch/loss": output["loss"].item(),
+                "batch/caption_loss": output["caption_loss"].item(),
+                "batch/trajectory_loss": output["trajectory_loss"].item(),
+                "batch/gradient_norm_before_clip": float(grad_norm),
+            })
+
 
         return {
             key: value / sample_count
@@ -297,9 +353,7 @@ def build_train_val_datasets(config: Week2CoVLAConfig) -> tuple[CoVLADataset, Co
     return train_dataset, val_dataset
 
 
-def run_week2_training(
-    config: Week2CoVLAConfig,
-) -> list[dict[str, float]]:
+def run_week2_training(config: Week2CoVLAConfig):
     train_dataset, val_dataset = build_train_val_datasets(config)
     collator = Week2DataCollator(config)
 
@@ -332,6 +386,20 @@ def run_week2_training(
             train_metrics = trainer.train_epoch(train_loader)
             val_metrics = trainer.evaluate(val_loader)
 
+            # Visualize one sample
+            sample = val_dataset[0]
+            batch = trainer._move(collator([sample]))
+            with torch.no_grad(), torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16,
+            ):
+                output = model(**batch)
+
+            figure = plot_prediction(
+                sample,
+                output["pred_trajectory"][0],
+            )
+
             epoch_metrics = {
                 "epoch": epoch + 1,
                 **{
@@ -344,6 +412,14 @@ def run_week2_training(
                 },
             }
             history.append(epoch_metrics)
+
+            # Same logging, with prediction image
+            wandb.log({
+                "epoch": epoch + 1,
+                **{f"train/{key}": value for key, value in train_metrics.items()},
+                **{f"val/{key}": value for key, value in val_metrics.items()},
+                "val/trajectory_prediction": wandb.Image(figure),
+            })
 
             for key, value in train_metrics.items():
                 trainer.writer.add_scalar(
@@ -359,9 +435,11 @@ def run_week2_training(
                     epoch + 1,
                 )
 
+            plt.close(figure)
+
             print(epoch_metrics)
 
     finally:
         trainer.writer.close()
 
-    return history
+    return model, val_dataset, collator, history

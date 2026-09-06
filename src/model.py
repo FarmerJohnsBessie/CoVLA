@@ -18,6 +18,10 @@ class Week2CoVLAConfig:
     frame_interval: int = 10
 
     log_dir: str = "runs/week2"
+    use_wandb: bool = True
+    wandb_project: str = "CoVLA"
+    wandb_run_name: str = "mini-training"
+    visualization_index: int = 0
 
     trajectory_points: int = 10
     trajectory_dim: int = 3
@@ -242,4 +246,3 @@ class Week2VLAModel(nn.Module):
 def build_model(config: Week2CoVLAConfig) -> Week2VLAModel:
     """Construct and return your Week2VLAModel."""
     return Week2VLAModel(config)
-
