@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -14,10 +14,15 @@ class Week2CoVLAConfig:
     """Data, model, and training settings"""
 
     data_dir: str = "data/covla-mini"
+    val_data_dir: str | None = None
     num_scenes: int | None = None
     frame_interval: int = 10
 
     log_dir: str = "runs/week2"
+    checkpoint_dir: str | None = None
+    checkpoint_every_steps: int = 1000
+    resume_from_checkpoint: bool = False
+    seed: int = 42
     use_wandb: bool = True
     wandb_project: str = "CoVLA"
     wandb_run_name: str = "mini-training"
@@ -30,10 +35,11 @@ class Week2CoVLAConfig:
     vision_encoder_hf: str = "openai/clip-vit-large-patch14"
     language_model_hf: str = "mistralai/Mistral-7B-Instruct-v0.2"
 
-    prompt: str = "Predict the ego vehicle's future trajectory."
+    prompt: str = "Describe the driving scene and the ego vehicle's future motion."
 
     # --- Optimization ---
     batch_size: int = 2
+    num_workers: int = 2
     learning_rate: float = 2e-5
     num_epochs: int = 5
     max_caption_tokens: int = 128
@@ -56,11 +62,12 @@ def compute_fde(pred: torch.Tensor, target: torch.Tensor) -> float:
 class Week2VLAModel(nn.Module):
     """Implement the CLIP, speed, language, caption, and trajectory stack here."""
 
-    def __init__(self, 
-                 config: Week2CoVLAConfig,
-                 vision_encoder: CLIPVisionModel | None = None,
-                 language_model: PreTrainedModel | None = None
-                ) -> None:
+    def __init__(
+        self,
+        config: Week2CoVLAConfig,
+        vision_encoder: CLIPVisionModel | None = None,
+        language_model: PreTrainedModel | None = None,
+    ) -> None:
 
         super().__init__()
         self.config = config
@@ -90,7 +97,7 @@ class Week2VLAModel(nn.Module):
 
         self.vision_projection = nn.Linear(vision_width, language_width)
         self.speed_projection = nn.Linear(1, language_width)
-        
+
         # Parameter (10, language_width), the 10 queries
         self.trajectory_queries = nn.Parameter(
             torch.empty(config.trajectory_points, language_width)
@@ -121,15 +128,15 @@ class Week2VLAModel(nn.Module):
         # Create the Image tokens
         with torch.no_grad():
             vision_output = self.vision_encoder(
-                pixel_values=pixel_values, 
+                pixel_values=pixel_values,
                 return_dict=True
             ) # (B, 257, 1024)
-        
+
         vision_tokens = vision_output.last_hidden_state[:, 1:] # Remove CLS token -> (B, 256, 1024)
         vision_tokens = self.vision_projection(vision_tokens) # (B, 256, 4096)
 
         # Create the speed tokens
-        speed = ego_speed.reshape(batch_size, 1) # (B, 1)
+        speed = ego_speed.reshape(batch_size, 1) / self.config.speed_scale
         speed_tokens = self.speed_projection(speed) # (B, 4096)
         speed_tokens = speed_tokens.unsqueeze(1) # (B, 1, 4096)
 
@@ -168,10 +175,12 @@ class Week2VLAModel(nn.Module):
 
         # --- Setup ---
         batch_size = prompt_ids.shape[0]
-        prefix_tokens, prefix_mask = self._encode_prefix(pixel_values, 
-                                                                          ego_speed, 
-                                                                          prompt_ids, 
-                                                                          prompt_mask)
+        prefix_tokens, prefix_mask = self._encode_prefix(
+            pixel_values,
+            ego_speed,
+            prompt_ids,
+            prompt_mask,
+        )
 
         embedding_layer = self.language_model.get_input_embeddings()
         caption_tokens = embedding_layer(caption_ids) # (B, T_caption, 4096)
@@ -189,12 +198,12 @@ class Week2VLAModel(nn.Module):
         # --- Finalize Input to LLM ---
         input_tokens = torch.cat(
             [prefix_tokens, caption_tokens, query_tokens], dim=1
-        ) # Query after token because we need attention from caption for query
+        ).to(self.language_model.dtype)
 
         input_mask = torch.cat(
             [prefix_mask, caption_mask, query_mask], dim=1
         )
-        
+
         # --- Calculate Position (Tells the token order) ---
         position_ids = input_mask.long().cumsum(dim=1) - 1
         position_ids.masked_fill_(input_mask == 0, 0)
@@ -227,7 +236,9 @@ class Week2VLAModel(nn.Module):
         hidden = language_output.hidden_states[-1] # (B, L, 4096)
 
         # --- Get Trajectory ---
-        queries = hidden[:, -self.config.trajectory_points :]
+        queries = hidden[:, -self.config.trajectory_points :].to(
+            self.trajectory_head[0].weight.dtype
+        )
         pred_trajectories = self.trajectory_head(queries) # (B, 10, 3)
 
         # Calculate loss

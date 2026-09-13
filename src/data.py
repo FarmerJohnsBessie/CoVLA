@@ -38,24 +38,31 @@ def read_json_records(path):
         return result
 
 
-def load_scene(root, scene_id):
+def load_scene(root, scene_id, frame_interval=1):
     states = read_json_records(root / "states" / f"{scene_id}.jsonl")
     captions = read_json_records(root / "captions" / f"{scene_id}.jsonl")
 
     assert len(states) == len(captions), "states and captions are not equal"
-    
+
     scene = []
-    for position, (state, caption) in enumerate(zip(states, captions)):
-        assert state["frame_id"] == position, "frame id not aligned"
+    for state, caption in zip(states, captions):
+        frame_id = state["frame_id"]
+        if (
+            frame_id % frame_interval != 0
+            or state["trajectory_count"] != 60
+        ):
+            continue
 
         image_path = root / state["image_path"]
+        if not image_path.is_file():
+            image_path = image_path.with_suffix(".jpg")
         if not image_path.is_file():
             raise FileNotFoundError(image_path)
 
         scene.append(
             {
                 "scene_id": scene_id,
-                "frame_id": position,
+                "frame_id": frame_id,
                 "state": state,
                 "caption" : caption,
                 "image_path": image_path,
@@ -98,12 +105,12 @@ class CoVLADataset(Dataset):
         self.sample = [] # list of samples loaded
         selected_scene_ids = scene_ids or get_scene_ids(self.root, number)
         for scene_id in selected_scene_ids:
-            scene = load_scene(self.root, scene_id=scene_id)
             self.sample.extend(
-                sample 
-                for sample in scene
-                if sample["frame_id"] % self.frame_interval == 0
-                and sample["state"]["trajectory_count"] == 60
+                load_scene(
+                    self.root,
+                    scene_id=scene_id,
+                    frame_interval=self.frame_interval,
+                )
             )
 
     def __len__(self):
@@ -124,6 +131,8 @@ class CoVLADataset(Dataset):
             ),
             "caption": scene["caption"]["rich_caption"],
             "trajectory": sample_trajectory(state["trajectory"]),
+            "extrinsic_matrix": state["extrinsic_matrix"],
+            "intrinsic_matrix": state["intrinsic_matrix"],
             "scene_id": scene["scene_id"],
             "frame_id": scene["frame_id"],
         }
