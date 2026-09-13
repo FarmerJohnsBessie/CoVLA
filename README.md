@@ -23,8 +23,16 @@ for validation, and excludes the 50 Mini scenes from training by timestamp.
 
 ```python
 mini_root = prepare_covla_mini(hf_token)
-train_root = prepare_covla_full(hf_token, mini_root=mini_root)
+train_root = prepare_covla_full(
+    hf_token,
+    mini_root=mini_root,
+    video_workers=4,
+)
 ```
+
+Each worker uses its own temporary cache. Raw MP4s are deleted as soon as
+their sampled frames are written, so parallel downloads do not retain the
+452 GB source dataset.
 
 Use `train_root` as `data_dir`, `mini_root` as `val_data_dir`, and keep
 `frame_interval=10` in `Week2CoVLAConfig`. The scratch disk is runtime-local,

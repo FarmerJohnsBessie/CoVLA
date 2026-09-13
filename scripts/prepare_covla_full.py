@@ -3,6 +3,7 @@
 import json
 import shutil
 import tarfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -243,6 +244,31 @@ def _extract_scene(video_path: Path, states: list[dict], output_root: Path) -> N
         )
 
 
+def _prepare_scene(
+    scene_id: str,
+    video_file: str,
+    token: str,
+    output_root: Path,
+    temp_root: Path,
+    cleanup_downloads: bool,
+) -> str:
+    states = _read_record_file(output_root / "states" / f"{scene_id}.jsonl")
+    if all(_image_path(output_root, state).is_file() for state in states):
+        return scene_id
+
+    if shutil.disk_usage(output_root).free / 1024**3 < 5:
+        raise RuntimeError("Less than 5 GB remains; stopping safely.")
+
+    cache_dir = temp_root / "videos" / scene_id
+    try:
+        video_path = _download(video_file, token, cache_dir)
+        _extract_scene(video_path, states, output_root)
+    finally:
+        if cleanup_downloads:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    return scene_id
+
+
 def prepare_covla_mini(
     token: str,
     output_root="/mnt/local-scratch/covla-mini",
@@ -320,12 +346,15 @@ def prepare_covla_full(
     frame_interval=10,
     num_scenes=None,
     cleanup_downloads=True,
+    video_workers=4,
 ) -> Path:
     """Prepare compact training images while excluding Mini validation scenes."""
     if not token:
         raise ValueError("A Hugging Face token is required")
     if frame_interval <= 0:
         raise ValueError("frame_interval must be positive")
+    if video_workers <= 0:
+        raise ValueError("video_workers must be positive")
 
     output_root = Path(output_root)
     mini_root = Path(mini_root) if mini_root else None
@@ -381,23 +410,36 @@ def prepare_covla_full(
             f"{sorted(missing_videos)[:5]}"
         )
 
-    for index, scene_id in enumerate(scene_ids, start=1):
-        states = _read_record_file(
-            output_root / "states" / f"{scene_id}.jsonl"
-        )
-        if all(_image_path(output_root, state).is_file() for state in states):
-            continue
+    incomplete = []
+    for scene_id in scene_ids:
+        states = _read_record_file(output_root / "states" / f"{scene_id}.jsonl")
+        if not all(_image_path(output_root, state).is_file() for state in states):
+            incomplete.append(scene_id)
 
-        free_gb = shutil.disk_usage(output_root).free / 1024**3
-        if free_gb < 5:
-            raise RuntimeError("Less than 5 GB remains; stopping safely.")
-
-        print(f"[{index}/{len(scene_ids)}] {scene_id}")
-        cache_dir = temp_root / "video"
-        video_path = _download(video_files[scene_id], token, cache_dir)
-        _extract_scene(video_path, states, output_root)
-        if cleanup_downloads:
-            shutil.rmtree(cache_dir)
+    completed = len(scene_ids) - len(incomplete)
+    executor = ThreadPoolExecutor(max_workers=video_workers)
+    futures = {
+        executor.submit(
+            _prepare_scene,
+            scene_id,
+            video_files[scene_id],
+            token,
+            output_root,
+            temp_root,
+            cleanup_downloads,
+        ): scene_id
+        for scene_id in incomplete
+    }
+    try:
+        for future in as_completed(futures):
+            scene_id = future.result()
+            completed += 1
+            print(f"[{completed}/{len(scene_ids)}] {scene_id}")
+    except BaseException:
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     print(f"Prepared {len(scene_ids)} training scenes in {output_root}")
     return output_root
