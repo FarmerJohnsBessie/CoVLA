@@ -10,5 +10,6 @@ tmp/
 
 # Virtual environments
 .venv
+.hf_token
 wandb/
 runs/
