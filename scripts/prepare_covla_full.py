@@ -3,6 +3,7 @@
 import json
 import shutil
 import tarfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -94,20 +95,28 @@ def _download(
     cache_dir: Path,
     repo_id: str = REPO_ID,
 ) -> Path:
-    for _ in range(2):
-        path = Path(
-            hf_hub_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                filename=filename,
-                token=token,
-                cache_dir=cache_dir,
+    last_error = None
+    for attempt in range(3):
+        try:
+            path = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    filename=filename,
+                    token=token,
+                    cache_dir=cache_dir,
+                )
             )
-        )
-        if path.stat().st_size:
-            return path
-        shutil.rmtree(cache_dir, ignore_errors=True)
-    raise RuntimeError(f"Downloaded an empty file twice: {filename}")
+            if path.stat().st_size:
+                return path
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except Exception as error:
+            last_error = error
+        if attempt < 2:
+            time.sleep(5 * 2**attempt)
+    if last_error is not None:
+        raise RuntimeError(f"Download failed three times: {filename}") from last_error
+    raise RuntimeError(f"Downloaded an empty file three times: {filename}")
 
 
 def _copy_download(
