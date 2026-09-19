@@ -54,6 +54,12 @@ def _write_records(path: Path, records: list[dict]) -> None:
         for record in records:
             output.write(json.dumps(record, separators=(",", ":")))
             output.write(chr(10))
+    _remove_appledouble(path)
+
+
+def _remove_appledouble(path: Path) -> None:
+    """Remove the FAT32 sidecar macOS creates for a generated file."""
+    path.with_name(f"._{path.name}").unlink(missing_ok=True)
 
 
 def _scene_signature(records: list[dict]):
@@ -88,15 +94,20 @@ def _download(
     cache_dir: Path,
     repo_id: str = REPO_ID,
 ) -> Path:
-    return Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename=filename,
-            token=token,
-            cache_dir=cache_dir,
+    for _ in range(2):
+        path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                filename=filename,
+                token=token,
+                cache_dir=cache_dir,
+            )
         )
-    )
+        if path.stat().st_size:
+            return path
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    raise RuntimeError(f"Downloaded an empty file twice: {filename}")
 
 
 def _copy_download(
@@ -110,7 +121,9 @@ def _copy_download(
         return
     source = _download(filename, token, cache_dir, MINI_REPO_ID)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    # copy2 creates AppleDouble `._*` files on FAT32 volumes.
+    shutil.copyfile(source, destination)
+    _remove_appledouble(destination)
 
 
 def _compact_states(
@@ -196,6 +209,7 @@ def _validation_signatures(mini_root: Path | None) -> set:
     signatures = {
         _scene_signature(_read_record_file(path))
         for path in state_dir.glob("*.jsonl")
+        if not path.name.startswith("._")
     }
     signatures.discard(None)
     return signatures
@@ -234,6 +248,8 @@ def _extract_scene(video_path: Path, states: list[dict], output_root: Path) -> N
                 temporary = destination.with_suffix(".tmp")
                 image.save(temporary, format="JPEG", quality=85)
                 temporary.replace(destination)
+                _remove_appledouble(temporary)
+                _remove_appledouble(destination)
             frame_id += 1
     finally:
         capture.release()
@@ -296,7 +312,11 @@ def prepare_covla_mini(
     for filename in metadata:
         _copy_download(filename, token, output_root, temp_root / "metadata")
 
-    scene_ids = sorted(path.stem for path in (output_root / "states").glob("*.jsonl"))
+    scene_ids = sorted(
+        path.stem
+        for path in (output_root / "states").glob("*.jsonl")
+        if not path.name.startswith("._")
+    )
     for index, scene_id in enumerate(scene_ids, start=1):
         marker = output_root / ".complete" / scene_id
         if marker.exists():
@@ -323,12 +343,25 @@ def prepare_covla_mini(
                     and member.name.endswith(".png")
                     and int(Path(member.name).stem) in selected_ids
                 ):
-                    archive.extract(member, output_root, filter="data")
+                    source = archive.extractfile(member)
+                    if source is None:
+                        continue
+                    destination = output_root / member.name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with destination.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+                    _remove_appledouble(destination)
         image_dir = output_root / "images" / scene_id
-        if len(list(image_dir.glob("*.png"))) != len(selected_ids):
+        images = [
+            path
+            for path in image_dir.glob("*.png")
+            if not path.name.startswith("._")
+        ]
+        if len(images) != len(selected_ids):
             raise RuntimeError(f"Incomplete Mini extraction for {scene_id}")
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
+        _remove_appledouble(marker)
         if cleanup_downloads:
             shutil.rmtree(cache_dir)
 
@@ -386,10 +419,15 @@ def prepare_covla_full(
         if written == 0:
             raise RuntimeError(f"No scenes were read from {filename}")
         marker.touch()
+        _remove_appledouble(marker)
         if cleanup_downloads:
             shutil.rmtree(cache_dir)
 
-    scene_ids = sorted(path.stem for path in (output_root / "states").glob("*.jsonl"))
+    scene_ids = sorted(
+        path.stem
+        for path in (output_root / "states").glob("*.jsonl")
+        if not path.name.startswith("._")
+    )
     if num_scenes is not None:
         scene_ids = scene_ids[:num_scenes]
 
