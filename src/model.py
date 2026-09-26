@@ -16,16 +16,22 @@ class Week2CoVLAConfig:
     data_dir: str = "data/covla-mini"
     val_data_dir: str | None = None
     num_scenes: int | None = None
+    num_val_scenes: int | None = None
     frame_interval: int = 10
 
     log_dir: str = "runs/week2"
     checkpoint_dir: str | None = None
     checkpoint_every_steps: int = 1000
-    resume_from_checkpoint: bool = False
+    resume_from_checkpoint: str | None = None
+    validation_every_steps: int = 1000
+    validation_max_batches: int | None = 25
+    log_every_steps: int = 1
+    training_visualization_every_steps: int = 100
     seed: int = 42
     use_wandb: bool = True
     wandb_project: str = "CoVLA"
     wandb_run_name: str = "mini-training"
+    wandb_run_id: str | None = None
     visualization_index: int = 0
 
     trajectory_points: int = 10
@@ -45,8 +51,6 @@ class Week2CoVLAConfig:
     max_caption_tokens: int = 128
     device: str = "cuda"
     max_grad_norm: float = 1.0
-
-    train_ratio: float = 0.8
 
 
 def compute_ade(pred: torch.Tensor, target: torch.Tensor) -> float:

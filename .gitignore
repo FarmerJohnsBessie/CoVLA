@@ -13,3 +13,8 @@ tmp/
 .hf_token
 wandb/
 runs/
+
+.tmp.driveupload/
+.tmp.drivedownload/
+.mypy_cache/
+

@@ -8,12 +8,19 @@ import torch
 import wandb
 from matplotlib import pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, CLIPImageProcessor
 
 from src.data import CoVLADataset, get_scene_ids
-from src.model import Week2CoVLAConfig, Week2VLAModel, build_model
+from src.model import (
+    Week2CoVLAConfig,
+    Week2VLAModel,
+    build_model,
+    compute_ade,
+    compute_fde,
+)
+from src.utils import generate_caption, predict_trajectory
 from src.visualize import plot_prediction
 
 
@@ -29,23 +36,6 @@ def _autocast(device: torch.device):
         enabled=device.type == "cuda",
     )
 
-
-def compute_ade(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    """Mean Euclidean distance over all waypoints and batch elements (meters if data is in m)."""
-    if pred.dim() == 2:
-        pred = pred.unsqueeze(0)
-        gt = gt.unsqueeze(0)
-    dist = torch.sqrt(((pred - gt) ** 2).sum(dim=-1))
-    return float(dist.mean().item())
-
-
-def compute_fde(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    """Mean Euclidean distance at the final waypoint."""
-    if pred.dim() == 2:
-        pred = pred.unsqueeze(0)
-        gt = gt.unsqueeze(0)
-    final = torch.sqrt(((pred[:, -1, :] - gt[:, -1, :]) ** 2).sum(dim=-1))
-    return float(final.mean().item())
 
 class Week2DataCollator:
     """Convert dataset samples into a padded multimodal model batch."""
@@ -136,151 +126,6 @@ class Week2DataCollator:
             )
         }
 
-# =============== Seperate Cell ===============
-@torch.inference_mode()
-def generate_caption(
-    model: Week2VLAModel,
-    sample: dict[str, Any],
-    collator: Week2DataCollator,
-    max_new_tokens: int = 64,
-) -> str:
-    """Generate a caption for one dataset sample from its image and speed."""
-    model.eval()
-    device = next(model.parameters()).device
-    batch = {
-        key: value.to(device)
-        for key, value in collator([sample]).items()
-    }
-
-    prefix_tokens, prefix_mask = model._encode_prefix(
-        batch["pixel_values"],
-        batch["ego_speed"],
-        batch["prompt_ids"],
-        batch["prompt_mask"],
-    )
-    language_dtype = next(model.language_model.parameters()).dtype
-    generated_ids = model.language_model.generate(
-        inputs_embeds=prefix_tokens.to(language_dtype),
-        attention_mask=prefix_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        eos_token_id=collator.tokenizer.eos_token_id,
-        pad_token_id=collator.tokenizer.pad_token_id,
-    )
-    return collator.tokenizer.decode(
-        generated_ids[0],
-        skip_special_tokens=True,
-    ).strip()
-
-
-@torch.inference_mode()
-def predict_trajectory(
-    model: Week2VLAModel,
-    sample: dict[str, Any],
-    collator: Week2DataCollator,
-) -> torch.Tensor:
-    """Predict one sample's trajectory on the model's current device."""
-    model.eval()
-    device = next(model.parameters()).device
-    batch = {
-        key: value.to(device)
-        for key, value in collator([sample]).items()
-    }
-    with _autocast(device):
-        output = model(**batch)
-    return output["pred_trajectory"][0].float().cpu()
-
-
-@torch.inference_mode()
-def find_worst_scenes(
-    model: Week2VLAModel,
-    dataset: Dataset,
-    collator: Week2DataCollator,
-    count: int = 10,
-    batch_size: int = 8,
-) -> list[dict[str, Any]]:
-    """Rank scenes by mean teacher-forced ADE, retaining each worst frame."""
-    model.eval()
-    device = next(model.parameters()).device
-    results = []
-    offset = 0
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collator,
-    )
-    for batch in loader:
-        moved = {key: value.to(device) for key, value in batch.items()}
-        with _autocast(device):
-            output = model(**moved)
-
-        prediction = output["pred_trajectory"].float().cpu()
-        target = batch["gt_trajectory"]
-        errors = torch.linalg.vector_norm(prediction - target, dim=-1)
-
-        for row in range(len(prediction)):
-            sample = dataset[offset + row]
-            results.append({
-                "index": offset + row,
-                "scene_id": sample["scene_id"],
-                "frame_id": sample["frame_id"],
-                "ade": errors[row].mean().item(),
-                "fde": errors[row, -1].item(),
-                "pred_trajectory": prediction[row],
-            })
-        offset += len(prediction)
-
-    by_scene = {}
-    for result in results:
-        by_scene.setdefault(result["scene_id"], []).append(result)
-
-    ranked = []
-    for scene_id, scene_results in by_scene.items():
-        worst_frame = max(scene_results, key=lambda result: result["ade"])
-        ranked.append({
-            **worst_frame,
-            "scene_id": scene_id,
-            "scene_ade": sum(row["ade"] for row in scene_results)
-            / len(scene_results),
-        })
-
-    return sorted(
-        ranked,
-        key=lambda result: result["scene_ade"],
-        reverse=True,
-    )[:count]
-
-
-def measure_speed_sensitivity(
-    model: Week2VLAModel,
-    sample: dict[str, Any],
-    collator: Week2DataCollator,
-    speeds: tuple[float, ...] = (0.0, 3.0, 7.0),
-) -> list[dict[str, Any]]:
-    """Measure how one fixed scene's outputs change with only speed varied."""
-    results = []
-    for speed in speeds:
-        counterfactual = {
-            **sample,
-            "speed": torch.tensor(speed, dtype=torch.float32),
-        }
-        prediction = predict_trajectory(model, counterfactual, collator)
-        results.append({
-            "speed_mps": speed,
-            "predicted_final_distance_m": torch.linalg.vector_norm(
-                prediction[-1, :2]
-            ).item(),
-            "generated_caption": generate_caption(
-                model,
-                counterfactual,
-                collator,
-            ),
-        })
-    return results
-# =============== Seperate Cell ===============
-
 
 class Week2VLATrainer:
     """Implement optimization, validation, metrics, and logging here."""
@@ -290,6 +135,7 @@ class Week2VLATrainer:
         model: Week2VLAModel,
         config: Week2CoVLAConfig,
         wandb_run: Any,
+        collator: Week2DataCollator,
     ) -> None:
         self.model = model
         self.config = config
@@ -307,9 +153,12 @@ class Week2VLATrainer:
 
         self.global_step = 0
         self.total_sample = 0
+        self.current_epoch = 0
+        self.next_batch = 0
         self.writer = SummaryWriter(config.log_dir)
         self.device = torch.device(self.config.device)
         self.wandb_run = wandb_run
+        self.collator = collator
 
     @property
     def checkpoint_path(self) -> Path | None:
@@ -317,8 +166,13 @@ class Week2VLATrainer:
             return None
         return Path(self.config.checkpoint_dir) / "latest.pt"
 
-    def save_checkpoint(self, epoch: int, next_batch: int) -> None:
-        """Atomically save only trainable weights and optimizer state."""
+    def save_checkpoint(
+        self,
+        epoch: int,
+        next_batch: int,
+        archive_epoch: bool = False,
+    ) -> None:
+        """Atomically save trainable weights and optimizer state."""
         path = self.checkpoint_path
         if path is None:
             return
@@ -342,15 +196,20 @@ class Week2VLATrainer:
             "batch_size": self.config.batch_size,
             "seed": self.config.seed,
         }
-        temporary = path.with_suffix(".tmp")
-        torch.save(state, temporary)
-        temporary.replace(path)
+        destinations = [path]
+        if archive_epoch:
+            destinations.append(path.parent / f"epoch_{epoch:04d}.pt")
+        for destination in destinations:
+            temporary = destination.with_suffix(".tmp")
+            torch.save(state, temporary)
+            temporary.replace(destination)
+        print(f"Saved checkpoint: {path}", flush=True)
 
-    def load_checkpoint(self) -> tuple[int, int]:
+    def load_checkpoint(self, checkpoint: str | Path) -> tuple[int, int]:
         """Restore a compact checkpoint and return (epoch, next_batch)."""
-        path = self.checkpoint_path
-        if path is None or not path.is_file():
-            return 0, 0
+        path = Path(checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(path)
         state = torch.load(path, map_location=self.device, weights_only=True)
         if state.get("batch_size") != self.config.batch_size:
             raise ValueError("Checkpoint batch_size does not match the config")
@@ -358,6 +217,8 @@ class Week2VLATrainer:
             raise ValueError("Checkpoint seed does not match the config")
         self.model.load_state_dict(state["model"], strict=False)
         self.optimizer.load_state_dict(state["optimizer"])
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.config.learning_rate
         self.global_step = state["global_step"]
         self.total_sample = state["total_sample"]
         print(
@@ -374,11 +235,52 @@ class Week2VLATrainer:
             for key, value in batch.items()
         }
 
+    def log_training_visualization(
+        self,
+        sample: dict[str, Any],
+        prediction: torch.Tensor,
+    ) -> None:
+        """Upload one camera/BEV training prediction to W&B."""
+        figure = None
+        try:
+            generated_caption = generate_caption(
+                self.model,
+                sample,
+                self.collator,
+            )
+            figure = plot_prediction(sample, prediction, generated_caption)
+            self.wandb_run.log({
+                "samples_seen": self.total_sample,
+                "training_example/visualization": wandb.Image(figure),
+                "training_example/ego_speed_mps": float(sample["speed"]),
+                "training_example/scene_id": sample["scene_id"],
+                "training_example/frame_id": sample["frame_id"],
+                "training_example/ground_truth_caption": sample["caption"],
+                "training_example/generated_caption": generated_caption,
+            })
+            self.writer.add_figure(
+                "training/example",
+                figure,
+                self.global_step,
+            )
+            print(
+                f"Uploaded training visualization at step={self.global_step} "
+                f"scene={sample['scene_id']} frame={sample['frame_id']}",
+                flush=True,
+            )
+        finally:
+            if figure is not None:
+                plt.close(figure)
+            self.model.train()
+
     def train_epoch(
         self,
         loader: DataLoader,
         epoch: int,
         batch_offset: int = 0,
+        val_loader: DataLoader | None = None,
+        visualization_dataset: CoVLADataset | None = None,
+        sample_indices: list[int] | None = None,
     ) -> dict[str, float]:
         self.model.train()
         totals = {
@@ -387,6 +289,9 @@ class Week2VLATrainer:
             "trajectory_loss": 0.0,
         }
         sample_count = 0
+        total_batches = batch_offset + len(loader)
+        self.current_epoch = epoch
+        self.next_batch = batch_offset
 
         for batch_index, batch in enumerate(loader):
             batch = self._move(batch)
@@ -456,6 +361,42 @@ class Week2VLATrainer:
                 "batch/speed_gradient_norm_after_clip": speed_gradient_norm,
             })
 
+            absolute_batch = batch_offset + batch_index + 1
+            self.next_batch = absolute_batch
+            if (
+                self.config.log_every_steps > 0
+                and (
+                    self.global_step % self.config.log_every_steps == 0
+                    or absolute_batch == total_batches
+                )
+            ):
+                print(
+                    f"epoch={epoch + 1}/{self.config.num_epochs} "
+                    f"batch={absolute_batch}/{total_batches} "
+                    f"step={self.global_step} "
+                    f"frames_seen={self.total_sample} "
+                    f"loss={output['loss'].item():.5f} "
+                    f"caption={output['caption_loss'].item():.5f} "
+                    f"trajectory={output['trajectory_loss'].item():.5f}",
+                    flush=True,
+                )
+
+            if (
+                self.config.use_wandb
+                and self.config.training_visualization_every_steps > 0
+                and self.global_step
+                % self.config.training_visualization_every_steps
+                == 0
+                and visualization_dataset is not None
+                and sample_indices is not None
+            ):
+                sample_offset = batch_index * self.config.batch_size
+                sample = visualization_dataset[sample_indices[sample_offset]]
+                self.log_training_visualization(
+                    sample,
+                    output["pred_trajectory"][0].detach().float().cpu(),
+                )
+
             if (
                 self.checkpoint_path is not None
                 and self.config.checkpoint_every_steps > 0
@@ -463,9 +404,42 @@ class Week2VLATrainer:
             ):
                 self.save_checkpoint(
                     epoch,
-                    batch_offset + batch_index + 1,
+                    absolute_batch,
                 )
 
+            if (
+                val_loader is not None
+                and self.config.validation_every_steps > 0
+                and self.global_step % self.config.validation_every_steps == 0
+                and absolute_batch < total_batches
+            ):
+                val_metrics = self.evaluate(
+                    val_loader,
+                    max_batches=self.config.validation_max_batches,
+                )
+                self.wandb_run.log({
+                    "samples_seen": self.total_sample,
+                    **{
+                        f"validation/{key}": value
+                        for key, value in val_metrics.items()
+                    },
+                })
+                for key, value in val_metrics.items():
+                    self.writer.add_scalar(
+                        f"validation/{key}",
+                        value,
+                        self.global_step,
+                    )
+                print(
+                    f"validation step={self.global_step} "
+                    f"frames_seen={self.total_sample} "
+                    f"samples={int(val_metrics['samples'])} "
+                    f"loss={val_metrics['loss']:.5f} "
+                    f"ADE={val_metrics['ade']:.3f} "
+                    f"FDE={val_metrics['fde']:.3f}",
+                    flush=True,
+                )
+                self.model.train()
 
         return {
             key: value / sample_count
@@ -473,7 +447,11 @@ class Week2VLATrainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, loader: DataLoader) -> dict[str, float]:
+    def evaluate(
+        self,
+        loader: DataLoader,
+        max_batches: int | None = None,
+    ) -> dict[str, float]:
         self.model.eval()
 
         totals = {
@@ -485,12 +463,13 @@ class Week2VLATrainer:
         predictions = []
         targets = []
 
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
             batch = self._move(batch)
 
             with _autocast(self.device):
                 output = self.model(**batch)
-
 
             batch_size = batch["pixel_values"].shape[0]
             sample_count += batch_size
@@ -507,6 +486,9 @@ class Week2VLATrainer:
                 batch["gt_trajectory"].detach().cpu()
             )
 
+        if sample_count == 0:
+            raise ValueError("Validation loader produced no samples")
+
         pred = torch.cat(predictions)
         target = torch.cat(targets)
 
@@ -517,76 +499,39 @@ class Week2VLATrainer:
 
         metrics["ade"] = compute_ade(pred, target)
         metrics["fde"] = compute_fde(pred, target)
+        metrics["samples"] = float(sample_count)
 
         return metrics
 
 
-def build_train_val_datasets(config: Week2CoVLAConfig) -> tuple[Dataset, Dataset]:
-    """Split scenes, then construct separate training and validation datasets."""
-    root = Path(config.data_dir)
-    scene_ids = get_scene_ids(root, config.num_scenes)
+def run_week2_training(config: Week2CoVLAConfig):
+    if config.val_data_dir is None:
+        raise ValueError("val_data_dir must point to the Mini validation dataset")
 
-    if not scene_ids:
-        raise ValueError(f"No scenes found in {root}")
-
-    if config.val_data_dir is not None:
-        val_root = Path(config.val_data_dir)
-        val_scene_ids = get_scene_ids(val_root)
-        if not val_scene_ids:
-            raise ValueError(f"No validation scenes found in {val_root}")
-        return (
-            CoVLADataset(
-                root,
-                frame_interval=config.frame_interval,
-                scene_ids=scene_ids,
-            ),
-            CoVLADataset(
-                val_root,
-                frame_interval=config.frame_interval,
-                scene_ids=val_scene_ids,
-            ),
-        )
-
-    if len(scene_ids) == 1:
-        dataset = CoVLADataset(
-            root,
-            frame_interval=config.frame_interval,
-            scene_ids=scene_ids,
-        )
-        if len(dataset) < 2:
-            raise ValueError("Training and validation require at least two samples")
-
-        split = round(len(dataset) * config.train_ratio)
-        split = min(max(split, 1), len(dataset) - 1)
-        print("Only one scene found; using a frame split for the local smoke test.")
-        return (
-            Subset(dataset, range(split)),
-            Subset(dataset, range(split, len(dataset))),
-        )
-
-    split = round(len(scene_ids) * config.train_ratio)
-    split = min(max(split, 1), len(scene_ids) - 1)
-
-    train_scene_ids = scene_ids[:split]
-    val_scene_ids = scene_ids[split:]
+    train_root = Path(config.data_dir)
+    val_root = Path(config.val_data_dir)
+    train_scene_ids = get_scene_ids(train_root, config.num_scenes)
+    val_scene_ids = get_scene_ids(val_root, config.num_val_scenes)
+    if not train_scene_ids:
+        raise ValueError(f"No training scenes found in {train_root}")
+    if not val_scene_ids:
+        raise ValueError(f"No validation scenes found in {val_root}")
 
     train_dataset = CoVLADataset(
-        root,
+        train_root,
         frame_interval=config.frame_interval,
         scene_ids=train_scene_ids,
     )
-
     val_dataset = CoVLADataset(
-        root,
+        val_root,
         frame_interval=config.frame_interval,
         scene_ids=val_scene_ids,
     )
-
-    return train_dataset, val_dataset
-
-
-def run_week2_training(config: Week2CoVLAConfig):
-    train_dataset, val_dataset = build_train_val_datasets(config)
+    print(
+        f"Training: {len(train_scene_ids)} scenes, {len(train_dataset)} frames | "
+        f"Validation: {len(val_scene_ids)} scenes, {len(val_dataset)} frames",
+        flush=True,
+    )
     collator = Week2DataCollator(config)
 
     val_loader = DataLoader(
@@ -603,20 +548,32 @@ def run_week2_training(config: Week2CoVLAConfig):
     wandb_run = wandb.init(
         project=config.wandb_project,
         name=config.wandb_run_name,
+        id=config.wandb_run_id,
+        resume="allow" if config.wandb_run_id else None,
+        allow_val_change=True,
         config=asdict(config),
         mode=None if config.use_wandb else "disabled",
     )
     wandb_run.define_metric("samples_seen")
     wandb_run.define_metric("batch/*", step_metric="samples_seen")
+    wandb_run.define_metric("training_example/*", step_metric="samples_seen")
+    wandb_run.define_metric("validation/*", step_metric="samples_seen")
     wandb_run.define_metric("epoch")
     wandb_run.define_metric("train/*", step_metric="epoch")
     wandb_run.define_metric("val/*", step_metric="epoch")
-    trainer = Week2VLATrainer(model, config, wandb_run)
+    trainer = Week2VLATrainer(model, config, wandb_run, collator)
     start_epoch, start_batch = (
-        trainer.load_checkpoint()
+        trainer.load_checkpoint(config.resume_from_checkpoint)
         if config.resume_from_checkpoint
         else (0, 0)
     )
+
+    batches_per_epoch = (
+        len(train_dataset) + config.batch_size - 1
+    ) // config.batch_size
+    if start_batch >= batches_per_epoch:
+        start_epoch += 1
+        start_batch = 0
 
     history = []
 
@@ -643,6 +600,9 @@ def run_week2_training(config: Week2CoVLAConfig):
                 train_loader,
                 epoch,
                 batch_offset=batch_offset,
+                val_loader=val_loader,
+                visualization_dataset=train_dataset,
+                sample_indices=order,
             )
             start_batch = 0
             val_metrics = trainer.evaluate(val_loader)
@@ -702,90 +662,23 @@ def run_week2_training(config: Week2CoVLAConfig):
             )
             plt.close(figure)
 
-            print(epoch_metrics)
-            trainer.save_checkpoint(epoch + 1, 0)
+            print(epoch_metrics, flush=True)
+            trainer.save_checkpoint(
+                epoch + 1,
+                0,
+                archive_epoch=True,
+            )
+
+    except KeyboardInterrupt:
+        print("Interrupted; saving the latest completed batch.", flush=True)
+        trainer.save_checkpoint(
+            trainer.current_epoch,
+            trainer.next_batch,
+        )
+        raise
 
     finally:
         trainer.writer.close()
         wandb_run.finish()
 
     return model, val_dataset, collator, history
-
-
-def main() -> None:
-    torch.manual_seed(42)
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
-    config = Week2CoVLAConfig(
-        device=device,
-        num_scenes=2,
-        num_epochs=1,
-        batch_size=1,
-        num_workers=0 if device != "cuda" else 2,
-        use_wandb=device == "cuda",
-    )
-
-    if device != "cuda":
-        config.vision_encoder_hf = (
-            "optimum-intel-internal-testing/tiny-random-CLIPModel"
-        )
-        config.language_model_hf = (
-            "HuggingFaceM4/tiny-random-MistralForCausalLM"
-        )
-        config.frame_interval = 100
-        config.max_caption_tokens = 32
-        config.learning_rate = 1e-3
-        print("No CUDA device found; using tiny random models for a local smoke test.")
-
-    model, val_dataset, collator, _ = run_week2_training(config)
-    worst = find_worst_scenes(
-        model,
-        val_dataset,
-        collator,
-        count=10,
-        batch_size=config.batch_size,
-    )
-
-    output_dir = Path(config.log_dir) / "worst_predictions"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for rank, result in enumerate(worst, start=1):
-        sample = val_dataset[result["index"]]
-        generated_caption = generate_caption(model, sample, collator)
-        prediction = predict_trajectory(
-            model,
-            {**sample, "caption": generated_caption},
-            collator,
-        )
-        figure = plot_prediction(
-            sample,
-            prediction,
-            generated_caption,
-        )
-        errors = torch.linalg.vector_norm(
-            prediction - sample["trajectory"],
-            dim=-1,
-        )
-        path = output_dir / f"{rank:02d}_index_{result['index']}.png"
-        figure.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(figure)
-        print(
-            f"Worst scene #{rank}: {result['scene_id']} "
-            f"(worst frame {result['frame_id']}, index {result['index']}), "
-            f"scene ADE={result['scene_ade']:.2f} m, "
-            f"worst-frame teacher-forced ADE={result['ade']:.2f} m, "
-            f"end-to-end ADE={errors.mean().item():.2f} m, "
-            f"FDE={errors[-1].item():.2f} m -> {path}"
-        )
-
-    print("Speed sensitivity:")
-    for result in measure_speed_sensitivity(model, val_dataset[0], collator):
-        print(result)
-
-
-if __name__ == "__main__":
-    main()

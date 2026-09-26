@@ -219,15 +219,16 @@ def plot_prediction(
     bev_axis.grid(True)
     bev_axis.legend()
     bev_axis.set_aspect("equal", adjustable="box")
-    x_margin = max(2.0, np.ptp(ground_truth[:, 0]) * 0.1)
-    y_margin = max(2.0, np.ptp(ground_truth[:, 1]) * 0.1)
+    all_points = np.concatenate([ground_truth, prediction])
+    x_margin = max(2.0, np.ptp(all_points[:, 0]) * 0.1)
+    y_margin = max(2.0, np.ptp(all_points[:, 1]) * 0.1)
     bev_axis.set_xlim(
-        ground_truth[:, 0].min() - x_margin,
-        ground_truth[:, 0].max() + x_margin,
+        all_points[:, 0].min() - x_margin,
+        all_points[:, 0].max() + x_margin,
     )
     bev_axis.set_ylim(
-        ground_truth[:, 1].min() - y_margin,
-        ground_truth[:, 1].max() + y_margin,
+        all_points[:, 1].min() - y_margin,
+        all_points[:, 1].max() + y_margin,
     )
 
     errors = np.linalg.norm(prediction - ground_truth, axis=-1)
